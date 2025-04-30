@@ -18,35 +18,34 @@ use axum::{
 use axum_client_ip::SecureClientIp;
 use common::get_pairing_file;
 use heartbeat::NewHeartbeatSender;
-use idevice::{installation_proxy::InstallationProxyClient, provider::TcpProvider, IdeviceService};
+use idevice::{
+    core_device_proxy::CoreDeviceProxy, debug_proxy::DebugProxyClient,
+    installation_proxy::InstallationProxyClient, provider::TcpProvider, IdeviceService,
+};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
 mod common;
 mod db;
-mod debug_server;
 mod heartbeat;
 mod mount;
+mod raw_packet;
 mod register;
-mod runner;
 
 #[derive(Clone)]
 struct JitStreamerState {
     pub new_heartbeat_sender: NewHeartbeatSender,
     pub mount_cache: mount::MountCache,
+    pub pairing_file_storage: String,
 }
 
 #[tokio::main]
 async fn main() {
     println!("Starting JitStreamer-EB, enabling logger");
     dotenvy::dotenv().ok();
-    //
+
     // Read the environment variable constants
-    let runner_count = std::env::var("RUNNER_COUNT")
-        .unwrap_or("10".to_string())
-        .parse::<u32>()
-        .unwrap();
     let allow_registration = std::env::var("ALLOW_REGISTRATION")
         .unwrap_or("1".to_string())
         .parse::<u8>()
@@ -55,6 +54,8 @@ async fn main() {
         .unwrap_or("9172".to_string())
         .parse::<u16>()
         .unwrap();
+    let pairing_file_storage =
+        std::env::var("PLIST_STORAGE").unwrap_or("/var/lib/lockdown".to_string());
 
     env_logger::init();
     info!("Logger initialized");
@@ -69,17 +70,12 @@ async fn main() {
         db.execute(include_str!("sql/up.sql")).unwrap();
     }
 
-    // Empty the queues
-    debug_server::empty().await;
-
     // Create a heartbeat manager
     let state = JitStreamerState {
         new_heartbeat_sender: heartbeat::heartbeat(),
         mount_cache: mount::MountCache::default(),
+        pairing_file_storage,
     };
-
-    // Run the Python shims
-    runner::run("src/runners/launch.py", runner_count);
 
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -99,7 +95,8 @@ async fn main() {
         )
         .route("/get_apps", get(get_apps))
         .route("/launch_app/{bundle_id}", get(launch_app))
-        .route("/status", get(status))
+        .route("/attach/{pid}", post(attach_app))
+        .route("/status", get(status)) // will be removed soon
         .with_state(state);
 
     let app = if allow_registration == 1 {
@@ -190,7 +187,7 @@ async fn get_apps(
 
     // Get the pairing file
     debug!("Getting pairing file for {udid}");
-    let pairing_file = match get_pairing_file(&udid).await {
+    let pairing_file = match get_pairing_file(&udid, &state.pairing_file_storage).await {
         Ok(pairing_file) => pairing_file,
         Err(e) => {
             info!("Failed to get pairing file: {:?}", e);
@@ -330,15 +327,17 @@ struct LaunchAppReturn {
     mounting: bool, // NOTICE: this field does literally nothing and will be removed in future
                     // versions
 }
+
 ///  - Get the IP from the request and UDID from the database
-/// - Make sure netmuxd still has the device
-///  - Check the mounted images for the developer disk image
-///    - If not mounted, add the device to the queue for mounting
-///    - Return a message letting the user know the device is mounting
+///  - Mount the device
 ///  - Connect to tunneld and get the interface and port for the developer service
 ///  - Send the commands to launch the app and detach
 ///  - Set last_used to now in the database
-async fn launch_app(ip: SecureClientIp, Path(bundle_id): Path<String>) -> Json<LaunchAppReturn> {
+async fn launch_app(
+    ip: SecureClientIp,
+    Path(bundle_id): Path<String>,
+    State(state): State<JitStreamerState>,
+) -> Json<LaunchAppReturn> {
     let ip = ip.0;
 
     info!("Got request to launch {bundle_id} from {:?}", ip);
@@ -356,56 +355,447 @@ async fn launch_app(ip: SecureClientIp, Path(bundle_id): Path<String>) -> Json<L
         }
     };
 
-    // Check if there are any launches queued
-    debug!("Checking launch queue for {udid}");
-    match debug_server::get_queue_info(&udid).await {
-        debug_server::LaunchQueueInfo::Position(p) => {
-            return Json(LaunchAppReturn {
-                ok: true,
-                launching: true,
-                position: Some(p),
-                error: None,
-                mounting: false,
-            });
-        }
-        debug_server::LaunchQueueInfo::NotInQueue => {}
-        debug_server::LaunchQueueInfo::Error(e) => {
+    // Get the pairing file
+    debug!("Getting pairing file for {udid}");
+    let pairing_file = match get_pairing_file(&udid, &state.pairing_file_storage).await {
+        Ok(pairing_file) => pairing_file,
+        Err(e) => {
+            info!("Failed to get pairing file: {:?}", e);
             return Json(LaunchAppReturn {
                 ok: false,
                 launching: false,
                 position: None,
-                error: Some(e),
                 mounting: false,
+                error: Some(format!("Failed to get pairing file: {:?}", e)),
             });
         }
-        debug_server::LaunchQueueInfo::ServerError => {
+    };
+
+    // Heartbeat the device
+    match heartbeat::heartbeat_thread(udid.clone(), ip, &pairing_file).await {
+        Ok(s) => {
+            state
+                .new_heartbeat_sender
+                .send(heartbeat::SendRequest::Store((udid.clone(), s)))
+                .await
+                .unwrap();
+        }
+        Err(e) => {
+            let e = match e {
+                idevice::IdeviceError::InvalidHostID => {
+                    "your pairing file is invalid. Regenerate it with jitterbug pair.".to_string()
+                }
+                _ => e.to_string(),
+            };
+            info!("Failed to heartbeat device: {:?}", e);
             return Json(LaunchAppReturn {
                 ok: false,
                 launching: false,
                 position: None,
-                error: Some("Failed to get launch status".to_string()),
                 mounting: false,
+                error: Some(format!("Failed to heartbeat device: {e}")),
             });
         }
     }
 
-    // Add the launch to the queue
-    match debug_server::add_to_queue(&udid, ip.to_string(), &bundle_id).await {
-        Some(position) => Json(LaunchAppReturn {
-            ok: true,
-            launching: true,
-            position: Some(position as usize),
-            error: None,
-            mounting: false,
-        }),
-        None => Json(LaunchAppReturn {
+    let provider = TcpProvider {
+        addr: ip,
+        pairing_file,
+        label: "JitStreamer-EB".to_string(),
+    };
+
+    let proxy = match CoreDeviceProxy::connect(&provider).await {
+        Ok(p) => p,
+        Err(e) => {
+            info!("Failed to proxy device: {:?}", e);
+            return Json(LaunchAppReturn {
+                ok: false,
+                launching: false,
+                position: None,
+                mounting: false,
+                error: Some(format!("Failed to start core device proxy: {e}")),
+            });
+        }
+    };
+    let rsd_port = proxy.handshake.server_rsd_port;
+    let mut adapter = match proxy.create_software_tunnel() {
+        Ok(a) => a,
+        Err(e) => {
+            info!("Failed to create software tunnel: {:?}", e);
+            return Json(LaunchAppReturn {
+                ok: false,
+                launching: false,
+                position: None,
+                mounting: false,
+                error: Some(format!("Failed to create software tunnel: {e}")),
+            });
+        }
+    };
+
+    if let Err(e) = adapter.connect(rsd_port).await {
+        info!("Failed to connect to RemoteXPC port: {:?}", e);
+        return Json(LaunchAppReturn {
             ok: false,
             launching: false,
             position: None,
-            error: Some("Failed to add to queue".to_string()),
             mounting: false,
-        }),
+            error: Some(format!("Failed to connect to RemoteXPC port: {e}")),
+        });
     }
+
+    let xpc_client = match idevice::xpc::XPCDevice::new(adapter).await {
+        Ok(x) => x,
+        Err(e) => {
+            log::warn!("Failed to connect to RemoteXPC: {e:?}");
+            return Json(LaunchAppReturn {
+                ok: false,
+                error: Some("Failed to connect to RemoteXPC".to_string()),
+                launching: false,
+                position: None,
+                mounting: false,
+            });
+        }
+    };
+
+    let dvt_port = match xpc_client.services.get(idevice::dvt::SERVICE_NAME) {
+        Some(s) => s.port,
+        None => {
+            return Json(LaunchAppReturn {
+                ok: false,
+                error: Some(
+                    "Device did not contain DVT service. Is the image mounted?".to_string(),
+                ),
+                launching: false,
+                position: None,
+                mounting: false,
+            });
+        }
+    };
+    let debug_proxy_port = match xpc_client.services.get(idevice::debug_proxy::SERVICE_NAME) {
+        Some(s) => s.port,
+        None => {
+            return Json(LaunchAppReturn {
+                ok: false,
+                error: Some(
+                    "Device did not contain debug server service. Is the image mounted?"
+                        .to_string(),
+                ),
+                launching: false,
+                position: None,
+                mounting: false,
+            });
+        }
+    };
+
+    let mut adapter = xpc_client.into_inner();
+    if let Err(e) = adapter.close().await {
+        log::warn!("Failed to close RemoteXPC port: {e:?}");
+        return Json(LaunchAppReturn {
+            ok: false,
+            error: Some("Failed to close RemoteXPC port".to_string()),
+            launching: false,
+            position: None,
+            mounting: false,
+        });
+    }
+
+    info!("Connecting to DVT port");
+    if let Err(e) = adapter.connect(dvt_port).await {
+        log::warn!("Failed to connect to DVT port: {e:?}");
+        return Json(LaunchAppReturn {
+            ok: false,
+            error: Some("Failed to connect to DVT port".to_string()),
+            launching: false,
+            position: None,
+            mounting: false,
+        });
+    }
+
+    let mut rs_client = match idevice::dvt::remote_server::RemoteServerClient::new(adapter) {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("Failed to create remote server client: {e:?}");
+            return Json(LaunchAppReturn {
+                ok: false,
+                error: Some(format!("Failed to create remote server client: {e:?}")),
+                launching: false,
+                position: None,
+                mounting: false,
+            });
+        }
+    };
+    if let Err(e) = rs_client.read_message(0).await {
+        log::warn!("Failed to read first message from remote server client: {e:?}");
+        return Json(LaunchAppReturn {
+            ok: false,
+            error: Some(format!(
+                "Failed to read first message from remote server client: {e:?}"
+            )),
+            launching: false,
+            position: None,
+            mounting: false,
+        });
+    }
+
+    let mut pc_client =
+        match idevice::dvt::process_control::ProcessControlClient::new(&mut rs_client).await {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("Failed to create process control client: {e:?}");
+                return Json(LaunchAppReturn {
+                    ok: false,
+                    error: Some(format!("Failed to create process control client: {e:?}")),
+                    launching: false,
+                    position: None,
+                    mounting: false,
+                });
+            }
+        };
+
+    let pid = match pc_client
+        .launch_app(bundle_id, None, None, true, false)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to launch app: {e:?}");
+            return Json(LaunchAppReturn {
+                ok: false,
+                error: Some(format!("Failed to launch app: {e:?}")),
+                launching: false,
+                position: None,
+                mounting: false,
+            });
+        }
+    };
+    debug!("Launched app with PID {pid}");
+    if let Err(e) = pc_client.disable_memory_limit(pid).await {
+        log::warn!("Failed to disable memory limit: {e:?}")
+    }
+
+    let mut adapter = rs_client.into_inner();
+    if let Err(e) = adapter.close().await {
+        log::warn!("Failed to close DVT port: {e:?}");
+        return Json(LaunchAppReturn {
+            ok: false,
+            error: Some("Failed to close RemoteXPC port".to_string()),
+            launching: false,
+            position: None,
+            mounting: false,
+        });
+    }
+
+    info!("Connecting to debug proxy port: {debug_proxy_port}");
+    if let Err(e) = adapter.connect(debug_proxy_port).await {
+        log::warn!("Failed to connect to debug proxy port: {e:?}");
+        return Json(LaunchAppReturn {
+            ok: false,
+            error: Some("Failed to connect to debug proxy port".to_string()),
+            launching: false,
+            position: None,
+            mounting: false,
+        });
+    }
+
+    let mut dp = DebugProxyClient::new(adapter);
+    let commands = [
+        format!("vAttach;{pid:02X}"),
+        "D".to_string(),
+        "D".to_string(),
+        "D".to_string(),
+        "D".to_string(),
+    ];
+    for command in commands {
+        match dp.send_command(command.into()).await {
+            Ok(res) => {
+                debug!("command res: {res:?}");
+            }
+            Err(e) => {
+                log::warn!("Failed to send command to debug server: {e:?}");
+                return Json(LaunchAppReturn {
+                    ok: false,
+                    error: Some(format!("Failed to send command to debug server: {e:?}")),
+                    launching: false,
+                    position: None,
+                    mounting: false,
+                });
+            }
+        }
+    }
+
+    debug!("JIT finished, killing heartbeat");
+    state
+        .new_heartbeat_sender
+        .send(heartbeat::SendRequest::Kill(udid.clone()))
+        .await
+        .unwrap();
+
+    Json(LaunchAppReturn {
+        ok: true,
+        error: None,
+        launching: true,   // true for compatibility reasons, will be removed
+        position: Some(0), // compat field
+        mounting: false,
+    })
+}
+
+// compat with OG JitStreamer
+#[derive(Debug, Serialize)]
+struct AttachReturn {
+    success: bool,
+    message: String,
+}
+
+impl AttachReturn {
+    fn fail(message: String) -> Self {
+        Self {
+            success: false,
+            message,
+        }
+    }
+}
+
+async fn attach_app(
+    ip: SecureClientIp,
+    Path(pid): Path<u16>,
+    State(state): State<JitStreamerState>,
+) -> Json<AttachReturn> {
+    let ip = ip.0;
+
+    info!("Got request to attach {pid} from {:?}", ip);
+
+    let udid = match common::get_udid_from_ip(ip.to_string()).await {
+        Ok(u) => u,
+        Err(e) => return Json(AttachReturn::fail(e)),
+    };
+
+    // Get the pairing file
+    debug!("Getting pairing file for {udid}");
+    let pairing_file = match get_pairing_file(&udid, &state.pairing_file_storage).await {
+        Ok(pairing_file) => pairing_file,
+        Err(e) => {
+            info!("Failed to get pairing file: {:?}", e);
+            return Json(AttachReturn::fail(format!(
+                "Failed to get pairing file: {:?}",
+                e
+            )));
+        }
+    };
+
+    // Heartbeat the device
+    match heartbeat::heartbeat_thread(udid.clone(), ip, &pairing_file).await {
+        Ok(s) => {
+            state
+                .new_heartbeat_sender
+                .send(heartbeat::SendRequest::Store((udid.clone(), s)))
+                .await
+                .unwrap();
+        }
+        Err(e) => {
+            let e = match e {
+                idevice::IdeviceError::InvalidHostID => {
+                    "your pairing file is invalid. Regenerate it with jitterbug pair.".to_string()
+                }
+                _ => e.to_string(),
+            };
+            info!("Failed to heartbeat device: {:?}", e);
+            return Json(AttachReturn::fail(format!(
+                "Failed to heartbeat device: {e}"
+            )));
+        }
+    }
+
+    let provider = TcpProvider {
+        addr: ip,
+        pairing_file,
+        label: "JitStreamer-EB".to_string(),
+    };
+
+    let proxy = match CoreDeviceProxy::connect(&provider).await {
+        Ok(p) => p,
+        Err(e) => {
+            info!("Failed to proxy device: {:?}", e);
+            return Json(AttachReturn::fail(format!(
+                "Failed to start core device proxy: {e}"
+            )));
+        }
+    };
+    let rsd_port = proxy.handshake.server_rsd_port;
+    let mut adapter = match proxy.create_software_tunnel() {
+        Ok(a) => a,
+        Err(e) => {
+            info!("Failed to create software tunnel: {:?}", e);
+            return Json(AttachReturn::fail(format!(
+                "Failed to create software tunnel: {e}"
+            )));
+        }
+    };
+    if let Err(e) = adapter.connect(rsd_port).await {
+        info!("Failed to connect to RemoteXPC port: {:?}", e);
+        return Json(AttachReturn::fail(format!(
+            "Failed to connect to RemoteXPC port: {e}"
+        )));
+    }
+
+    let xpc_client = match idevice::xpc::XPCDevice::new(adapter).await {
+        Ok(x) => x,
+        Err(e) => {
+            log::warn!("Failed to connect to RemoteXPC: {e:?}");
+            return Json(AttachReturn::fail(
+                "Failed to connect to RemoteXPC".to_string(),
+            ));
+        }
+    };
+
+    let service_port = match xpc_client.services.get(idevice::debug_proxy::SERVICE_NAME) {
+        Some(s) => s.port,
+        None => {
+            return Json(AttachReturn::fail(
+                "Device did not contain debug server service. Is the image mounted?".to_string(),
+            ));
+        }
+    };
+
+    let mut adapter = xpc_client.into_inner();
+    if let Err(e) = adapter.close().await {
+        log::warn!("Failed to close RemoteXPC port: {e:?}");
+        return Json(AttachReturn::fail(format!(
+            "Failed to close RemoteXPC port: {e:?}"
+        )));
+    }
+    if let Err(e) = adapter.connect(service_port).await {
+        log::warn!("Failed to connect to debug proxy port: {e:?}");
+        return Json(AttachReturn::fail(format!(
+            "Failed to connect to debug proxy port: {e:?}"
+        )));
+    }
+
+    let mut dp = DebugProxyClient::new(adapter);
+    let commands = [format!("vAttach;{pid:02X}"), "D".to_string()];
+    for command in commands {
+        match dp.send_command(command.into()).await {
+            Ok(res) => {
+                debug!("command res: {res:?}");
+            }
+            Err(e) => {
+                log::warn!("Failed to send command to debug server: {e:?}");
+                return Json(AttachReturn::fail(format!(
+                    "Failed to send command to debug server: {e:?}"
+                )));
+            }
+        }
+    }
+
+    state
+        .new_heartbeat_sender
+        .send(heartbeat::SendRequest::Kill(udid.clone()))
+        .await
+        .unwrap();
+
+    Json(AttachReturn {
+        success: true,
+        message: "".to_string(),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -417,81 +807,14 @@ struct StatusReturn {
     in_progress: bool, // NOTICE: this field is deprecated and will be removed in future versions
 }
 
-/// Gets the current status of the device
-/// Returns immediately if done or error
-/// Checks every second, up to 15 seconds for a new response.
-async fn status(ip: SecureClientIp) -> Json<StatusReturn> {
-    let start_time = std::time::Instant::now();
-    let ip = ip.0;
-
-    let udid = match common::get_udid_from_ip(ip.to_string()).await {
-        Ok(u) => u,
-        Err(e) => {
-            return Json(StatusReturn {
-                ok: false,
-                done: true,
-                error: Some(e),
-                position: 0,
-                in_progress: false,
-            })
-        }
-    };
-
-    loop {
-        // Check mounts
-        // Check launches
-        // Check if it's been too long
-        let mut to_return = None;
-        match debug_server::get_queue_info(&udid).await {
-            debug_server::LaunchQueueInfo::Position(p) => {
-                to_return = Some(Json(StatusReturn {
-                    ok: true,
-                    done: false,
-                    position: p,
-                    error: None,
-                    in_progress: false,
-                }));
-            }
-            debug_server::LaunchQueueInfo::NotInQueue => {}
-            debug_server::LaunchQueueInfo::Error(e) => {
-                to_return = Some(Json(StatusReturn {
-                    ok: false,
-                    done: true,
-                    position: 0,
-                    error: Some(e),
-                    in_progress: false,
-                }));
-            }
-            debug_server::LaunchQueueInfo::ServerError => {
-                to_return = Some(Json(StatusReturn {
-                    ok: false,
-                    done: true,
-                    position: 0,
-                    error: Some("server error".to_string()),
-                    in_progress: false,
-                }));
-            }
-        }
-
-        match to_return {
-            Some(to_return) => {
-                if start_time.elapsed() > std::time::Duration::from_secs(15) || to_return.done {
-                    info!("Returning status for {udid}: {to_return:?}");
-                    return to_return;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            None => {
-                if to_return.is_none() {
-                    return Json(StatusReturn {
-                        ok: true,
-                        done: true,
-                        position: 0,
-                        error: None,
-                        in_progress: false,
-                    });
-                }
-            }
-        }
-    }
+/// Stub function to remain compatible with dependant apps
+/// Will be removed in future updates
+async fn status() -> Json<StatusReturn> {
+    Json(StatusReturn {
+        ok: true,
+        done: true,
+        position: 0,
+        error: None,
+        in_progress: false,
+    })
 }
